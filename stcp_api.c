@@ -208,7 +208,6 @@ ssize_t stcp_network_send(mysocket_t sd, const void *src, size_t src_len, ...)
     while ((next_buf = va_arg(argptr, const void *)))
     {
         size_t next_len = va_arg(argptr, size_t);
-
         assert(packet_len + next_len <= sizeof(packet));
         memcpy(packet + packet_len, next_buf, next_len);
         packet_len += next_len;

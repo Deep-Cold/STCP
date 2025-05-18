@@ -151,6 +151,7 @@ loop_until_end(int sd)
             fflush(stdout);
             if (!fgets(line, sizeof(line), stdin))
                 break;
+            printf("line: %s\n", line);
 
             /* Remove trailing spaces and add CRLF at the end */
             pline = line + strlen(line) - 1;
@@ -168,14 +169,13 @@ loop_until_end(int sd)
         *++pline = '\r';
         *++pline = '\n';
         *++pline = '\0';
-
+        printf("Sending line: %s %d\n", line, pline - line);
         if (mywrite(sd, line, pline - line) < 0)
         {
             perror("mywrite");
             errcnd = 1;
             break;
         }
-
         if (get_nvt_line(sd, line) < 0)
         {
             perror("get_nvt_line");

@@ -74,6 +74,7 @@ void _mysock_set_checksum(const mysock_context_t *ctx,
     assert(len >= sizeof(struct tcphdr));
 
     assert(ctx->network_state.peer_addr.sa_family == AF_INET);
+    //printf("peer_addr: %d, local_addr: %d\n", ((struct sockaddr_in *) &ctx->network_state.peer_addr)->sin_addr.s_addr, _network_get_local_addr((network_context_t *) &ctx->network_state));
 
     ((struct tcphdr *) packet)->th_sum = _mysock_tcp_checksum(
         _network_get_local_addr((network_context_t *)
@@ -94,6 +95,8 @@ bool_t _mysock_verify_checksum(const mysock_context_t *ctx,
 
     assert(ctx->network_state.peer_addr.sa_family == AF_INET);
 
+
+    //printf("peer_addr: %d, local_addr: %d\n", ((struct sockaddr_in *) &ctx->network_state.peer_addr)->sin_addr.s_addr, _network_get_local_addr((network_context_t *) &ctx->network_state));
     my_sum = _mysock_tcp_checksum(
         ((struct sockaddr_in *) &ctx->network_state.peer_addr)-> /*src*/
             sin_addr.s_addr,
@@ -101,6 +104,7 @@ bool_t _mysock_verify_checksum(const mysock_context_t *ctx,
                                 &ctx->network_state), /*dst*/
         packet, len);
 
+    //printf("my_sum: %d, th_sum: %d\n", my_sum, ((struct tcphdr *) packet)->th_sum);
     return my_sum == ((struct tcphdr *) packet)->th_sum;
 }
 
