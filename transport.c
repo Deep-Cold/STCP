@@ -136,7 +136,7 @@ void transport_init(mysocket_t sd, bool_t is_active)
                     if(header->th_flags & TH_SYN && header->th_flags & TH_ACK) {
                         ctx->ack_num = header->th_seq + 1;
                         ctx->connection_state = SYN_RECEIVED;
-                        ctx->cur_window_size = MIN(header->th_win, CONGESTION_WINDOW_SIZE);
+                        ctx->cur_window_size = MIN(header->th_win, CONGESTION_WINDOW_SIZE) / MAX_PAYLOAD_SIZE;
                         ctx->window_threshold = ctx->cur_window_size;
                         packet_send(sd, ctx, NULL, 0, TH_ACK, ctx->seq_num);
                         gettimeofday(&ctx->last_send_time, NULL);
@@ -162,7 +162,7 @@ void transport_init(mysocket_t sd, bool_t is_active)
                         ctx->connection_state = SYN_RECEIVED;
                         printf("SYN packet received\n");
                         ctx->seq_num = ctx->initial_sequence_num;
-                        ctx->cur_window_size = MIN(CONGESTION_WINDOW_SIZE, header->th_win);
+                        ctx->cur_window_size = MIN(CONGESTION_WINDOW_SIZE, header->th_win) / MAX_PAYLOAD_SIZE;
                         ctx->window_threshold = ctx->cur_window_size;
                         packet_send(sd, ctx, NULL, 0, TH_SYN | TH_ACK, ctx->seq_num);
                         ctx->seq_num++;
@@ -236,12 +236,15 @@ static void control_loop(mysocket_t sd, context_t *ctx)
         event = stcp_wait_for_event(sd, APP_DATA | NETWORK_DATA, &ts);
         //printf("Event received: 0x%x\n", event);
 
-        if(ctx->connection_state == TIMED_WAIT && !(event & NETWORK_DATA)) {
-            ctx->done = TRUE;
-            ctx->connection_state = CLOSED;
-            stcp_fin_received(sd);
-            printf("Client Ended\n");
-            break;
+        if(ctx->connection_state == TIMED_WAIT) {
+            event = stcp_wait_for_event(sd, APP_DATA | NETWORK_DATA, &ts);
+            if(!(event & NETWORK_DATA)) {
+                ctx->done = TRUE;
+                ctx->connection_state = CLOSED;
+                stcp_fin_received(sd);
+                printf("Client Ended\n");
+                break;
+            }
         }
 
         /* check whether it was the network, app, or a close request */
@@ -374,6 +377,31 @@ static void process_in_data(mysocket_t sd, context_t *ctx, char *data, int len) 
 
     if(header->th_flags & TH_ACK) {
         printf("header->th_ack: %d, ctx->seq_num: %d\n", header->th_ack, ctx->seq_num);
+        ctx->retransmit_count = 0;
+        if(ctx->cur_window_size < ctx->window_threshold) {
+            ctx->cur_window_size = MIN(ctx->cur_window_size * 2, ctx->window_threshold);
+        } else {
+            ctx->cur_window_size = MIN(ctx->cur_window_size + 1, MIN(CONGESTION_WINDOW_SIZE, header->th_win) / MAX_PAYLOAD_SIZE);
+        }
+        int del = header->th_ack - ctx->seq_num;
+        //printf("ctx->seq_num: %d, header->th_ack: %d\n", ctx->seq_num, header->th_ack);
+        if(del == 0) {
+            if(ctx -> connection_state == ESTABLISHED || ctx -> connection_state == CLOSE_WAIT) ctx->dup_cnt++;
+            if(ctx->dup_cnt == 3) {
+                int siz = MIN(MAX_PAYLOAD_SIZE, ctx->send_buffer_idx);
+                if(siz) packet_send(sd, ctx, ctx->send_buffer, siz, TH_ACK, ctx->seq_num);
+                ctx->dup_cnt = 0;
+            }
+        } else if(del > 0) {
+            del = MIN(del, (int)ctx->send_buffer_idx);
+            ctx->dup_cnt = 0;
+            memmove(ctx->send_buffer, ctx->send_buffer + del, RECV_WINDOW_SIZE - del);
+            //printf("Moving send buffer, del: %d, new_idx: %ld\n", del, ctx->send_buffer_idx - del);
+            ctx->send_buffer_idx -= del;
+            ctx->sent_buffer_idx -= del;
+            ctx->seq_num = header->th_ack;
+        }
+        printf("Updated window size to: %d\n", ctx->cur_window_size);
         if(ctx -> connection_state == SYN_RECEIVED && header->th_ack == ctx->seq_num) {
             ctx->connection_state = ESTABLISHED;
             stcp_unblock_application(sd);
@@ -389,32 +417,6 @@ static void process_in_data(mysocket_t sd, context_t *ctx, char *data, int len) 
             ctx->done = TRUE;
             return;
         }
-        ctx->retransmit_count = 0;
-        if(ctx->cur_window_size < ctx->window_threshold) {
-            ctx->cur_window_size = MIN(ctx->cur_window_size * 2, ctx->window_threshold);
-        } else {
-            ctx->cur_window_size = MIN(ctx->cur_window_size + 1, MIN(CONGESTION_WINDOW_SIZE, header->th_win));
-        }
-        int del = header->th_ack - ctx->seq_num;
-        //printf("ctx->seq_num: %d, header->th_ack: %d\n", ctx->seq_num, header->th_ack);
-        if(del == 0) {
-            ctx->dup_cnt++;
-            if(ctx->dup_cnt == 3) {
-                int siz = MIN(MAX_PAYLOAD_SIZE, ctx->send_buffer_idx);
-                if(siz) packet_send(sd, ctx, ctx->send_buffer, siz, TH_ACK, ctx->seq_num);
-                ctx->dup_cnt = 0;
-            }
-        } else if(del > 0) {
-            ctx->dup_cnt = 0;
-            memmove(ctx->send_buffer, ctx->send_buffer + del, RECV_WINDOW_SIZE - del);
-            //printf("Moving send buffer, del: %d, new_idx: %ld\n", del, ctx->send_buffer_idx - del);
-            assert(ctx->sent_buffer_idx >= (size_t)del);
-            assert(ctx->send_buffer_idx >= (size_t)del);
-            ctx->send_buffer_idx -= del;
-            ctx->sent_buffer_idx -= del;
-            ctx->seq_num = header->th_ack;
-        }
-        printf("Updated window size to: %d\n", ctx->cur_window_size);
     }
 
     if(header->th_flags & TH_FIN) {
@@ -512,7 +514,7 @@ static void process_out_data(mysocket_t sd, context_t *ctx, bool_t is_retransmit
     }
 
     tcp_seq window_start = ctx->sent_buffer_idx;
-    tcp_seq window_end = MIN(window_start + ctx->cur_window_size, ctx->send_buffer_idx);
+    tcp_seq window_end = MIN(ctx->cur_window_size * MAX_PAYLOAD_SIZE, ctx->send_buffer_idx);
     //printf("ctx->cur_window_size: %ld, ctx->send_buffer_idx: %ld\n", ctx->sent_buffer_idx, ctx->send_buffer_idx);
     //printf("window_start: %d, window_end: %d\n", window_start, window_end);
 
