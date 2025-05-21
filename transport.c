@@ -57,7 +57,7 @@ typedef struct
     uint16_t window_threshold;
 
     char *send_buffer;
-    size_t send_buffer_idx, sent_buffer_idx;
+    int send_buffer_idx, sent_buffer_idx;
     char *recv_buffer;
     bool_t *get_buffer;
 
@@ -136,7 +136,7 @@ void transport_init(mysocket_t sd, bool_t is_active)
                     if(header->th_flags & TH_SYN && header->th_flags & TH_ACK) {
                         ctx->ack_num = header->th_seq + 1;
                         ctx->connection_state = SYN_RECEIVED;
-                        ctx->cur_window_size = MIN(header->th_win, CONGESTION_WINDOW_SIZE) / MAX_PAYLOAD_SIZE;
+                        ctx->cur_window_size = MIN(header->th_win, CONGESTION_WINDOW_SIZE) / MAX_PAYLOAD_SIZE + 1; 
                         ctx->window_threshold = ctx->cur_window_size;
                         packet_send(sd, ctx, NULL, 0, TH_ACK, ctx->seq_num);
                         gettimeofday(&ctx->last_send_time, NULL);
@@ -162,7 +162,7 @@ void transport_init(mysocket_t sd, bool_t is_active)
                         ctx->connection_state = SYN_RECEIVED;
                         printf("SYN packet received\n");
                         ctx->seq_num = ctx->initial_sequence_num;
-                        ctx->cur_window_size = MIN(CONGESTION_WINDOW_SIZE, header->th_win) / MAX_PAYLOAD_SIZE;
+                        ctx->cur_window_size = MIN(CONGESTION_WINDOW_SIZE, header->th_win) / MAX_PAYLOAD_SIZE + 1;
                         ctx->window_threshold = ctx->cur_window_size;
                         packet_send(sd, ctx, NULL, 0, TH_SYN | TH_ACK, ctx->seq_num);
                         ctx->seq_num++;
@@ -237,11 +237,11 @@ static void control_loop(mysocket_t sd, context_t *ctx)
         //printf("Event received: 0x%x\n", event);
 
         if(ctx->connection_state == TIMED_WAIT) {
+            ts.tv_nsec *= 5;
             event = stcp_wait_for_event(sd, APP_DATA | NETWORK_DATA, &ts);
             if(!(event & NETWORK_DATA)) {
                 ctx->done = TRUE;
                 ctx->connection_state = CLOSED;
-                stcp_fin_received(sd);
                 printf("Client Ended\n");
                 break;
             }
@@ -266,7 +266,7 @@ static void control_loop(mysocket_t sd, context_t *ctx)
         }
 
         if(event & APP_CLOSE_REQUESTED) {
-            printf("Received app close requested\n");
+            //printf("Received app close requested\n");
             //printf("ctx->connection_state: %d\n", ctx->connection_state);
             if(ctx->connection_state == ESTABLISHED) {
                 ctx->connection_state = FIN_WAIT_1;
@@ -286,11 +286,6 @@ static void control_loop(mysocket_t sd, context_t *ctx)
 static void packet_send(mysocket_t sd, context_t *ctx, char *data, int len, uint8_t flags, int seq_num) {
     char data_send[MAX_PAYLOAD_SIZE + sizeof(STCPHeader)];
     STCPHeader *header = (STCPHeader *)data_send;
-    context_t *current_ctx;
-
-    assert(ctx);
-    current_ctx = (context_t *)stcp_get_context(sd);
-    assert(current_ctx == ctx);
 
     memset(data_send, 0, sizeof(data_send));
     header->th_seq = seq_num;
@@ -328,6 +323,7 @@ static void check_timeout(mysocket_t sd, context_t *ctx) {
                 case SYN_RECEIVED:
                     packet_send(sd, ctx, NULL, 0, TH_SYN | TH_ACK, ctx->seq_num - 1);
                     break;
+                case CLOSE_WAIT:
                 case ESTABLISHED:
                     printf("Retransmitting data, retransmit_count: %d\n", ctx->retransmit_count);
                     ctx->sent_buffer_idx = 0;
@@ -376,32 +372,36 @@ static void process_in_data(mysocket_t sd, context_t *ctx, char *data, int len) 
     //        header->th_flags, header->th_seq, header->th_ack, payload_len);
 
     if(header->th_flags & TH_ACK) {
-        printf("header->th_ack: %d, ctx->seq_num: %d\n", header->th_ack, ctx->seq_num);
-        ctx->retransmit_count = 0;
-        if(ctx->cur_window_size < ctx->window_threshold) {
-            ctx->cur_window_size = MIN(ctx->cur_window_size * 2, ctx->window_threshold);
-        } else {
-            ctx->cur_window_size = MIN(ctx->cur_window_size + 1, MIN(CONGESTION_WINDOW_SIZE, header->th_win) / MAX_PAYLOAD_SIZE);
-        }
-        int del = header->th_ack - ctx->seq_num;
-        //printf("ctx->seq_num: %d, header->th_ack: %d\n", ctx->seq_num, header->th_ack);
-        if(del == 0) {
-            if(ctx -> connection_state == ESTABLISHED || ctx -> connection_state == CLOSE_WAIT) ctx->dup_cnt++;
-            if(ctx->dup_cnt == 3) {
-                int siz = MIN(MAX_PAYLOAD_SIZE, ctx->send_buffer_idx);
-                if(siz) packet_send(sd, ctx, ctx->send_buffer, siz, TH_ACK, ctx->seq_num);
-                ctx->dup_cnt = 0;
+        //printf("header->th_ack: %d, ctx->seq_num: %d\n", header->th_ack, ctx->seq_num);
+        if(ctx -> connection_state == ESTABLISHED || ctx -> connection_state == CLOSE_WAIT) {
+            ctx->retransmit_count = 0;
+            if(ctx->cur_window_size < ctx->window_threshold) {
+                ctx->cur_window_size = MIN(ctx->cur_window_size * 2, ctx->window_threshold);
+            } else {
+                ctx->cur_window_size = MIN(ctx->cur_window_size + 1, MIN(CONGESTION_WINDOW_SIZE, header->th_win) / MAX_PAYLOAD_SIZE + 1);
             }
-        } else if(del > 0) {
-            del = MIN(del, (int)ctx->send_buffer_idx);
-            ctx->dup_cnt = 0;
-            memmove(ctx->send_buffer, ctx->send_buffer + del, RECV_WINDOW_SIZE - del);
-            //printf("Moving send buffer, del: %d, new_idx: %ld\n", del, ctx->send_buffer_idx - del);
-            ctx->send_buffer_idx -= del;
-            ctx->sent_buffer_idx -= del;
-            ctx->seq_num = header->th_ack;
+            int del = header->th_ack - ctx->seq_num;
+            //printf("ctx->seq_num: %d, header->th_ack: %d\n", ctx->seq_num, header->th_ack);
+            if(del == 0) {
+                ctx->dup_cnt++;
+                if(ctx->dup_cnt == 3) {
+                    int siz = MIN(MAX_PAYLOAD_SIZE, ctx->send_buffer_idx);
+                    if(siz) packet_send(sd, ctx, ctx->send_buffer, siz, TH_ACK, ctx->seq_num);
+                    ctx->dup_cnt = 0;
+                }
+            } else if(del > 0) {
+                ctx->dup_cnt = 0;
+                if(del < RECV_WINDOW_SIZE)
+                    memmove(ctx->send_buffer, ctx->send_buffer + del, RECV_WINDOW_SIZE - del);
+                //printf("Moving send buffer, del: %d, new_idx: %ld\n", del, ctx->send_buffer_idx - del);
+                assert(ctx->send_buffer_idx >= del);
+                ctx->send_buffer_idx -= del;
+                if(ctx->sent_buffer_idx < del) ctx->sent_buffer_idx = 0;
+                else ctx->sent_buffer_idx -= del;
+                ctx->seq_num = header->th_ack;
+            }
+            printf("Updated window size to: %d\n", ctx->cur_window_size);
         }
-        printf("Updated window size to: %d\n", ctx->cur_window_size);
         if(ctx -> connection_state == SYN_RECEIVED && header->th_ack == ctx->seq_num) {
             ctx->connection_state = ESTABLISHED;
             stcp_unblock_application(sd);
@@ -419,40 +419,39 @@ static void process_in_data(mysocket_t sd, context_t *ctx, char *data, int len) 
         }
     }
 
-    if(header->th_flags & TH_FIN) {
-        handle_fin(sd, ctx);
-    }
-    
-    if(payload_len > 0 && ctx->connection_state == ESTABLISHED) {
+    if(payload_len > 0) {
         printf("Received data packet, seq: %d, ack: %d, len: %d\n", 
-               header->th_seq, header->th_ack, payload_len);
-        tcp_seq window_start = ctx->ack_num;
-        tcp_seq window_end = window_start + RECV_WINDOW_SIZE - 1;
-
-        if(header->th_seq >= window_start && header->th_seq <= window_end) {
-            int valid_len = MIN(payload_len, (int)(window_end - header->th_seq + 1));
-            assert(header->th_seq - window_start + valid_len <= RECV_BUFFER_SIZE);
+            header->th_seq, header->th_ack, payload_len);
             
-            memmove(ctx->recv_buffer + header->th_seq - window_start, payload, valid_len);
-
+        tcp_seq window_start = ctx->ack_num;
+        //printf("Current ack: %d\n", window_start);
+        tcp_seq window_end = window_start + RECV_WINDOW_SIZE;
+            
+        if(header->th_seq >= window_start && header->th_seq < window_end) {
+            int valid_len = MIN(payload_len, (int)(window_end - header->th_seq));
+            //assert(header->th_seq - window_start + valid_len <= RECV_BUFFER_SIZE);
+            
+            memmove(ctx->recv_buffer + (header->th_seq - window_start), payload, valid_len);
+            
             for(int i = 0; i < valid_len; i++) {
                 ctx->get_buffer[header->th_seq - window_start + i] = TRUE;
             }
-
+            
             if(header->th_seq == window_start) {
                 int new_start = 0;
                 while(new_start < RECV_BUFFER_SIZE && ctx->get_buffer[new_start]) {
                     new_start++;
                 }
                 if(new_start < RECV_BUFFER_SIZE) {
-                    memmove(ctx->get_buffer, ctx->get_buffer + new_start, RECV_BUFFER_SIZE - new_start);
+                    memmove(ctx->get_buffer, ctx->get_buffer + new_start, (RECV_BUFFER_SIZE - new_start) * sizeof(bool_t));
                 }
-                memset(ctx->get_buffer + RECV_BUFFER_SIZE - new_start, 0, new_start);
+                memset(ctx->get_buffer + RECV_BUFFER_SIZE - new_start, 0, new_start * sizeof(bool_t));
                 int valid_len = new_start;
                 if(valid_len > 0) {
                     ctx->ack_num += valid_len;
                     printf("Sending data to application, len: %d\n", valid_len);
                     stcp_app_send(sd, ctx->recv_buffer, valid_len);
+                    memmove(ctx->recv_buffer, ctx->recv_buffer + valid_len, RECV_BUFFER_SIZE - valid_len);
                 }
             }
             packet_send(sd, ctx, NULL, 0, TH_ACK, ctx->seq_num);
@@ -463,26 +462,26 @@ static void process_in_data(mysocket_t sd, context_t *ctx, char *data, int len) 
                 int overlap_start = window_start - header->th_seq;
                 int overlap_len = MIN(payload_len - overlap_start, RECV_WINDOW_SIZE);
                 assert(overlap_len > 0);
-                assert(overlap_len <= RECV_BUFFER_SIZE);
                 
                 memmove(ctx->recv_buffer, payload + overlap_start, overlap_len);
                 for(int i = 0; i < overlap_len; i++) {
                     ctx->get_buffer[i] = TRUE;
                 }
-
+                
                 int new_start = 0;
                 while(new_start < RECV_BUFFER_SIZE && ctx->get_buffer[new_start]) {
                     new_start++;
                 }
                 if(new_start < RECV_BUFFER_SIZE) {
-                    memmove(ctx->get_buffer, ctx->get_buffer + new_start, RECV_BUFFER_SIZE - new_start);
+                    memmove(ctx->get_buffer, ctx->get_buffer + new_start, (RECV_BUFFER_SIZE - new_start) * sizeof(bool_t));
                 }
-                memset(ctx->get_buffer + RECV_BUFFER_SIZE - new_start, 0, new_start);
+                memset(ctx->get_buffer + RECV_BUFFER_SIZE - new_start, 0, new_start * sizeof(bool_t));
                 int valid_len = new_start;
                 if(valid_len > 0) {
                     ctx->ack_num += valid_len;
-                    printf("Sending overlapped data to application, len: %d\n", valid_len);
+                    printf("Sending data to application, len: %d\n", valid_len);
                     stcp_app_send(sd, ctx->recv_buffer, valid_len);
+                    memmove(ctx->recv_buffer, ctx->recv_buffer + valid_len, RECV_BUFFER_SIZE - valid_len);
                 }
             }
             packet_send(sd, ctx, NULL, 0, TH_ACK, ctx->seq_num);
@@ -490,8 +489,11 @@ static void process_in_data(mysocket_t sd, context_t *ctx, char *data, int len) 
             printf("Packet with seq %d is after window end %d\n", header->th_seq, window_end);
         }
     }
+    if(header->th_flags & TH_FIN) {
+        handle_fin(sd, ctx);
+    }
 }
-
+    
 static void process_out_data(mysocket_t sd, context_t *ctx, bool_t is_retransmit) {
     if(ctx->connection_state != ESTABLISHED && ctx->connection_state != CLOSE_WAIT) {
         printf("Connection not established, cannot send data\n");
@@ -500,7 +502,7 @@ static void process_out_data(mysocket_t sd, context_t *ctx, bool_t is_retransmit
     if(is_retransmit) {
         //printf("process_out_data, is_retransmit: %d\n", is_retransmit);
     } else {
-        //printf("process_out_data\n");
+    //printf("process_out_data\n");
     }
     int len = RECV_WINDOW_SIZE - ctx->send_buffer_idx;
     if(len > 0 && !is_retransmit) {
@@ -508,11 +510,11 @@ static void process_out_data(mysocket_t sd, context_t *ctx, bool_t is_retransmit
         len = stcp_app_recv(sd, ctx->send_buffer + ctx->send_buffer_idx, len);
         //printf("Received data from application, len: %d\n", len);
         if(len > 0) {
-           // printf("Received data from application, len: %d\n", len);
             ctx->send_buffer_idx += len;
         }
     }
 
+    //printf("sent_buffer_idx: %d, send_buffer_idx: %d\n", ctx->sent_buffer_idx, ctx->send_buffer_idx);
     tcp_seq window_start = ctx->sent_buffer_idx;
     tcp_seq window_end = MIN(ctx->cur_window_size * MAX_PAYLOAD_SIZE, ctx->send_buffer_idx);
     //printf("ctx->cur_window_size: %ld, ctx->send_buffer_idx: %ld\n", ctx->sent_buffer_idx, ctx->send_buffer_idx);
@@ -520,13 +522,12 @@ static void process_out_data(mysocket_t sd, context_t *ctx, bool_t is_retransmit
 
     for(unsigned int i = window_start; i < window_end;) {
         int size = MIN(window_end - i, MAX_PAYLOAD_SIZE);
-        printf("Sending data packet, seq: %d, len: %d\n", ctx->seq_num, size);
+        printf("Sending data packet, seq: %d, len: %d, i: %d\n", ctx->seq_num + i, size, i);
         packet_send(sd, ctx, ctx->send_buffer + i, size, TH_ACK, ctx->seq_num + i);
         i += size;
         gettimeofday(&ctx->last_send_time, NULL);
     }
-    ctx->sent_buffer_idx = ctx->send_buffer_idx;
-
+    ctx->sent_buffer_idx = window_end;
 }
 
 /**********************************************************************/
