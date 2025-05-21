@@ -2,7 +2,7 @@
 
 #### Overview
 
-This is a project with implementation of a TCP-style transport layer protocol. To extend to the basic design of TCP, we allows the receiver to buffer all the possible information in the receiver window. This allow the reusability of the information, which makes the transportation faster. 
+This is a project with implementation of a TCP-style transport layer protocol. We allows the receiver to buffer all the possible information in the receiver window. This allow the reusability of the information, which makes the transportation faster. 
 
 
 
